@@ -1,36 +1,68 @@
 <#
 .SYNOPSIS
-  Replace your Cursor Freshdesk MCP with CoreBridge/freshdesk_mcp (working Windows setup).
+  Install / update the CoreBridge Freshdesk MCP for Cursor on Windows.
 
 .DESCRIPTION
-  One-shot installer that applies the known-good CoreBridge Freshdesk MCP config and
-  skips the pitfalls we hit during rollout:
+  One-shot installer for CoreBridge/freshdesk_mcp in Cursor (~/.cursor/mcp.json).
 
+  DEFAULT: gateway mode. No Freshdesk API key is needed.
+    - Freshdesk is reached through the CoreBridge Freshdesk gateway (https://<gateway>/staff/fd).
+    - You sign in with your CoreBridge Microsoft (Entra ID) account through the
+      "Freshdesk Gateway Client" app. A browser window opens once; the token is cached
+      (encrypted with Windows DPAPI) and refreshed silently afterwards.
+    - The gateway environment defaults to prod (live Freshdesk data). It is sent as X-CB-Env.
+
+  OPTIONAL: -ApiKeyMode keeps the old direct mode (Freshdesk API with your personal API key).
+
+  In both modes the installer also:
     1. Uses the CoreBridge GitHub repo via uvx (not the old local Node install)
     2. Pins mcp[cli]>=1.3.0,<2 (mcp 2.x breaks FastMCP / server will not start)
-    3. Sets FRESHDESK_DOMAIN to atomology.freshdesk.com
-       (supportdesk.corebridge.net is for browser login only; API calls there return 404)
-    4. Installs uv/uvx if missing, using a full path so Cursor can find it
-    5. Removes the obsolete ~/.cursor/freshdesk-mcp Node folder if present
-    6. Keeps your other MCP servers in mcp.json untouched
-    7. Optionally verifies the API key with /api/v2/agents/me
+    3. Installs uv/uvx if missing, using a full path so Cursor can find it
+    4. Removes the obsolete ~/.cursor/freshdesk-mcp Node folder if present
+    5. Keeps your other MCP servers in mcp.json untouched (and backs the file up first)
+
+.PARAMETER GatewayUrl
+  Freshdesk gateway base URL (gateway mode). Default: the CoreBridge production gateway.
+
+.PARAMETER GatewayEnv
+  Gateway environment sent as X-CB-Env: dev, qa, preview or prod. Default: prod.
+  dev/qa are cache-only (no live lists/searches, no writes).
+
+.PARAMETER DeviceCode
+  Sign in with a device code (URL + one-time code) instead of a browser window.
+
+.PARAMETER ClientId
+  Entra public client app id. Default: "Freshdesk Gateway Client" (b00e08ff-9e23-42f4-97b2-da02455ae39b).
+
+.PARAMETER ApiKeyMode
+  Use the legacy direct mode: call the Freshdesk API with your personal API key.
 
 .PARAMETER ApiKey
-  Your personal Freshdesk API key (Profile Settings -> API Key).
+  (ApiKeyMode only) Your personal Freshdesk API key (Profile Settings -> API Key).
   If omitted, the script keeps an existing key in mcp.json, or prompts.
 
 .PARAMETER Domain
-  Freshdesk API host. Default: atomology.freshdesk.com (required for API; do not use the custom support URL).
+  (ApiKeyMode only) Freshdesk API host. Default: atomology.freshdesk.com
+  (do not use supportdesk.corebridge.net; it is for browser login only and the API 404s there).
+
+.PARAMETER Ref
+  Optional git branch/tag/commit of CoreBridge/freshdesk_mcp to install (default: the default branch).
 
 .PARAMETER SkipVerify
-  Skip the live API smoke test.
+  Gateway mode: skip the sign-in step (you are asked to sign in on the first tool call instead).
+  ApiKeyMode: skip the live API key check.
 
 .EXAMPLE
-  # Interactive (prompts for API key if needed)
+  # Gateway mode, production (recommended)
   powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1 -ApiKey "YOUR_KEY_HERE"
+  # Gateway mode against preview, signing in with a device code
+  powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1 -GatewayEnv preview -DeviceCode
+
+.EXAMPLE
+  # Legacy direct mode with a Freshdesk API key
+  powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1 -ApiKeyMode -ApiKey "YOUR_KEY_HERE"
 
 .NOTES
   After it finishes: Cursor -> Command Palette -> "Developer: Reload Window"
@@ -40,12 +72,116 @@
 
 [CmdletBinding()]
 param(
+    [string]$GatewayUrl = "https://cus-cb-fd-gateway-cjccdjf4gxg5dbhr.centralus-01.azurewebsites.net",
+    [ValidateSet("dev", "qa", "preview", "prod")]
+    [string]$GatewayEnv = "prod",
+    [switch]$DeviceCode,
+    [string]$ClientId = "b00e08ff-9e23-42f4-97b2-da02455ae39b",
+    [switch]$ApiKeyMode,
     [string]$ApiKey = "",
     [string]$Domain = "atomology.freshdesk.com",
+    [string]$Ref = "",
+    [Alias("SkipSignIn")]
     [switch]$SkipVerify
 )
 
 $ErrorActionPreference = "Stop"
+
+$ServerName = "freshdesk-mcp"
+$RepoUrl = "git+https://github.com/CoreBridge/freshdesk_mcp"
+$McpPin = "mcp[cli]>=1.3.0,<2"
+
+# ---------------------------------------------------------------------------
+# Pure helpers (dot-source this script to test them; see tests/installer/)
+# ---------------------------------------------------------------------------
+
+function Get-FreshdeskPackageSpec {
+    param([string]$Ref = "")
+    if ([string]::IsNullOrWhiteSpace($Ref)) { return $RepoUrl }
+    return "$RepoUrl@$($Ref.Trim())"
+}
+
+function Get-NormalizedGatewayUrl {
+    <# Returns https://host[:port] for a gateway URL or bare host; throws on anything unsafe. #>
+    param([Parameter(Mandatory = $true)][string]$GatewayUrl)
+    $text = $GatewayUrl.Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { throw "GatewayUrl is empty." }
+    if ($text -notmatch "://") { $text = "https://$text" }
+    $uri = $null
+    if (-not [Uri]::TryCreate($text, [UriKind]::Absolute, [ref]$uri)) {
+        throw "GatewayUrl '$GatewayUrl' is not a valid URL."
+    }
+    if ($uri.Scheme -ne "https") {
+        throw "GatewayUrl must use https (an Entra token is sent to it): '$GatewayUrl'."
+    }
+    if ($uri.Host -match "(^|\.)freshdesk\.com$") {
+        throw "GatewayUrl points at Freshdesk ($($uri.Host)), not the CoreBridge gateway. Use -ApiKeyMode for direct Freshdesk access."
+    }
+    $port = ""
+    if (-not $uri.IsDefaultPort) { $port = ":$($uri.Port)" }
+    return "https://$($uri.Host)$port"
+}
+
+function New-FreshdeskMcpEntry {
+    <# Builds the mcp.json server block. Gateway mode never carries a Freshdesk API key. #>
+    param(
+        [Parameter(Mandatory = $true)][string]$UvxPath,
+        [ValidateSet("gateway", "apikey")][string]$Mode = "gateway",
+        [string]$GatewayUrl = "",
+        [string]$GatewayEnv = "prod",
+        [switch]$DeviceCode,
+        [string]$ClientId = "",
+        [string]$ApiKey = "",
+        [string]$Domain = "",
+        [string]$Ref = ""
+    )
+
+    $envBlock = [ordered]@{}
+    if ($Mode -eq "gateway") {
+        $envBlock["FRESHDESK_AUTH_MODE"] = "entra"
+        $envBlock["FRESHDESK_DOMAIN"] = (Get-NormalizedGatewayUrl -GatewayUrl $GatewayUrl)
+        $envBlock["FRESHDESK_GATEWAY_ENV"] = $GatewayEnv
+        if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
+            $envBlock["FRESHDESK_ENTRA_CLIENT_ID"] = $ClientId
+        }
+        if ($DeviceCode) { $envBlock["FRESHDESK_ENTRA_FLOW"] = "device_code" }
+    } else {
+        if ([string]::IsNullOrWhiteSpace($ApiKey)) { throw "ApiKeyMode needs a Freshdesk API key." }
+        $envBlock["FRESHDESK_AUTH_MODE"] = "apikey"
+        $envBlock["FRESHDESK_API_KEY"] = $ApiKey
+        $envBlock["FRESHDESK_DOMAIN"] = $Domain
+    }
+
+    return [ordered]@{
+        command = ($UvxPath -replace '\\', '/')
+        args    = @("--from", (Get-FreshdeskPackageSpec -Ref $Ref), "--with", $McpPin, $ServerName)
+        env     = $envBlock
+    }
+}
+
+function Merge-McpServerEntry {
+    <# Returns the whole mcp.json object with only $Name replaced; every other server is kept. #>
+    param(
+        $Existing,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)]$Entry
+    )
+    $servers = [ordered]@{}
+    if ($null -ne $Existing -and $null -ne $Existing.mcpServers) {
+        foreach ($prop in $Existing.mcpServers.PSObject.Properties) {
+            if ($prop.Name -ne $Name) { $servers[$prop.Name] = $prop.Value }
+        }
+    }
+    $servers[$Name] = $Entry
+    return [ordered]@{ mcpServers = $servers }
+}
+
+# Dot-sourced (tests): stop here, after the helpers are defined.
+if ($MyInvocation.InvocationName -eq ".") { return }
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 function Write-Step([string]$Message) {
     Write-Host ""
@@ -63,10 +199,21 @@ function Get-UvBinDir {
     return $candidates[0]
 }
 
+$Mode = "gateway"
+if ($ApiKeyMode) { $Mode = "apikey" }
+
 Write-Host "CoreBridge Freshdesk MCP installer" -ForegroundColor Green
-Write-Host "Repo: https://github.com/CoreBridge/freshdesk_mcp"
-Write-Host "API domain (required): $Domain"
-Write-Host "Note: use atomology.freshdesk.com for API, not supportdesk.corebridge.net"
+$refNote = ""
+if ($Ref) { $refNote = " (ref $Ref)" }
+Write-Host "Repo: https://github.com/CoreBridge/freshdesk_mcp$refNote"
+if ($Mode -eq "gateway") {
+    $GatewayUrl = Get-NormalizedGatewayUrl -GatewayUrl $GatewayUrl
+    Write-Host "Mode: gateway (Entra sign-in, no Freshdesk API key)"
+    Write-Host "Gateway: $GatewayUrl   environment: $GatewayEnv"
+} else {
+    Write-Host "Mode: API key (direct to $Domain)"
+    Write-Host "Note: use atomology.freshdesk.com for API, not supportdesk.corebridge.net"
+}
 
 # ---------------------------------------------------------------------------
 # 1) Ensure uv / uvx
@@ -74,14 +221,12 @@ Write-Host "Note: use atomology.freshdesk.com for API, not supportdesk.corebridg
 Write-Step "Checking for uv / uvx"
 $uvBin = Get-UvBinDir
 $uvx = Join-Path $uvBin "uvx.exe"
-$uv = Join-Path $uvBin "uv.exe"
 
 if (-not (Test-Path $uvx)) {
     Write-Host "uvx not found. Installing uv..."
     powershell -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex"
     $uvBin = Get-UvBinDir
     $uvx = Join-Path $uvBin "uvx.exe"
-    $uv = Join-Path $uvBin "uv.exe"
     if (-not (Test-Path $uvx)) {
         throw "uv installed but uvx.exe not found under $uvBin. Open a new terminal and re-run this script."
     }
@@ -91,90 +236,59 @@ Write-Host "Using uvx: $uvx"
 & $uvx --version | Write-Host
 
 # ---------------------------------------------------------------------------
-# 2) Resolve API key
+# 2) Read existing mcp.json; resolve the API key (ApiKeyMode only)
 # ---------------------------------------------------------------------------
-Write-Step "Resolving Freshdesk API key"
 $mcpPath = Join-Path $env:USERPROFILE ".cursor\mcp.json"
-$existingKey = $null
+$existing = $null
 if (Test-Path $mcpPath) {
     try {
         $existing = Get-Content $mcpPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        $existingKey = $existing.mcpServers.'freshdesk-mcp'.env.FRESHDESK_API_KEY
     } catch {
-        Write-Host "Could not parse existing mcp.json; will create/replace Freshdesk entry only if possible."
+        throw "Could not parse $mcpPath ($($_.Exception.Message)). Fix or move it, then re-run."
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-    if (-not [string]::IsNullOrWhiteSpace($existingKey) -and $existingKey -notmatch "PASTE_|YOUR_|changeme") {
-        $ApiKey = $existingKey
-        Write-Host "Keeping existing FRESHDESK_API_KEY from mcp.json (ends with ...$($ApiKey.Substring([Math]::Max(0,$ApiKey.Length-4))))"
-    } else {
-        $secure = Read-Host "Paste your Freshdesk API key" -AsSecureString
-        $ApiKey = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-            [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-        )
+if ($Mode -eq "apikey") {
+    Write-Step "Resolving Freshdesk API key"
+    $existingKey = $null
+    if ($null -ne $existing -and $null -ne $existing.mcpServers -and $null -ne $existing.mcpServers.$ServerName) {
+        $existingKey = $existing.mcpServers.$ServerName.env.FRESHDESK_API_KEY
     }
-}
-
-if ([string]::IsNullOrWhiteSpace($ApiKey) -or $ApiKey.Length -lt 10) {
-    throw "A real Freshdesk API key is required. Get it from Freshdesk -> Profile Settings -> API Key."
+    if ([string]::IsNullOrWhiteSpace($ApiKey)) {
+        if (-not [string]::IsNullOrWhiteSpace($existingKey) -and $existingKey -notmatch "PASTE_|YOUR_|changeme") {
+            $ApiKey = $existingKey
+            Write-Host "Keeping existing FRESHDESK_API_KEY from mcp.json"
+        } else {
+            $secure = Read-Host "Paste your Freshdesk API key" -AsSecureString
+            $ApiKey = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+            )
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($ApiKey) -or $ApiKey.Length -lt 10) {
+        throw "A real Freshdesk API key is required. Get it from Freshdesk -> Profile Settings -> API Key."
+    }
 }
 
 # ---------------------------------------------------------------------------
 # 3) Update ~/.cursor/mcp.json (Freshdesk entry only)
 # ---------------------------------------------------------------------------
 Write-Step "Updating $mcpPath"
-
 if (-not (Test-Path (Split-Path $mcpPath -Parent))) {
     New-Item -ItemType Directory -Path (Split-Path $mcpPath -Parent) -Force | Out-Null
 }
-
-$mcp = $null
 if (Test-Path $mcpPath) {
     $backup = "$mcpPath.bak-freshdesk-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
     Copy-Item $mcpPath $backup -Force
     Write-Host "Backup: $backup"
-    $mcp = Get-Content $mcpPath -Raw -Encoding UTF8 | ConvertFrom-Json
-} else {
-    $mcp = [pscustomobject]@{ mcpServers = [pscustomobject]@{} }
 }
 
-if (-not $mcp.mcpServers) {
-    $mcp | Add-Member -NotePropertyName mcpServers -NotePropertyValue ([pscustomobject]@{}) -Force
-}
-
-# Build Freshdesk server block (known-good)
-$uvxForward = ($uvx -replace '\\', '/')
-$freshdeskBlock = [ordered]@{
-    command = $uvxForward
-    args    = @(
-        "--from"
-        "git+https://github.com/CoreBridge/freshdesk_mcp"
-        "--with"
-        "mcp[cli]>=1.3.0,<2"
-        "freshdesk-mcp"
-    )
-    env     = [ordered]@{
-        FRESHDESK_API_KEY = $ApiKey
-        FRESHDESK_DOMAIN  = $Domain
-    }
-}
-
-# ConvertTo-Json on nested PSCustomObject: set via hashtable merge
-$serversHash = [ordered]@{}
-foreach ($prop in $mcp.mcpServers.PSObject.Properties) {
-    if ($prop.Name -ne "freshdesk-mcp") {
-        $serversHash[$prop.Name] = $prop.Value
-    }
-}
-$serversHash["freshdesk-mcp"] = $freshdeskBlock
-
-$outObj = [ordered]@{ mcpServers = $serversHash }
+$entry = New-FreshdeskMcpEntry -UvxPath $uvx -Mode $Mode -GatewayUrl $GatewayUrl -GatewayEnv $GatewayEnv `
+    -DeviceCode:$DeviceCode -ClientId $ClientId -ApiKey $ApiKey -Domain $Domain -Ref $Ref
+$outObj = Merge-McpServerEntry -Existing $existing -Name $ServerName -Entry $entry
 $json = $outObj | ConvertTo-Json -Depth 12
 [System.IO.File]::WriteAllText($mcpPath, $json, [System.Text.UTF8Encoding]::new($false))
-Write-Host "Wrote freshdesk-mcp -> $uvxForward (CoreBridge git + mcp<2 pin)"
-Write-Host "FRESHDESK_DOMAIN=$Domain"
+Write-Host "Wrote $ServerName ($Mode mode) -> $($entry.command)"
 
 # ---------------------------------------------------------------------------
 # 4) Remove obsolete Node install
@@ -189,40 +303,24 @@ if (Test-Path $oldNode) {
 }
 
 # ---------------------------------------------------------------------------
-# 5) Pre-warm package (downloads Python deps once)
+# 5) Sign in (gateway) or verify the API key (apikey)
 # ---------------------------------------------------------------------------
-Write-Step "Pre-warming CoreBridge freshdesk-mcp package (first run can take a minute)"
-$env:FRESHDESK_API_KEY = $ApiKey
-$env:FRESHDESK_DOMAIN = $Domain
-$prewarm = Start-Process -FilePath $uvx `
-    -ArgumentList @(
-        "--from", "git+https://github.com/CoreBridge/freshdesk_mcp",
-        "--with", "mcp[cli]>=1.3.0,<2",
-        "freshdesk-mcp"
-    ) `
-    -NoNewWindow -PassThru `
-    -RedirectStandardOutput (Join-Path $env:TEMP "fd-mcp-prewarm.out") `
-    -RedirectStandardError (Join-Path $env:TEMP "fd-mcp-prewarm.err")
-Start-Sleep -Seconds 12
-if (-not $prewarm.HasExited) {
-    Stop-Process -Id $prewarm.Id -Force -ErrorAction SilentlyContinue
-    Write-Host "Package start OK (stdio server launched; stopped after smoke start)"
-} else {
-    $err = Get-Content (Join-Path $env:TEMP "fd-mcp-prewarm.err") -ErrorAction SilentlyContinue
-    $joined = ($err | Select-Object -First 15) -join "`n"
-    if ($joined -match "Starting Freshdesk MCP server") {
-        Write-Host "Package start OK"
-    } elseif ($joined -match "FastMCP|mcp 2\.x") {
-        throw "MCP dependency pin failed. Re-run this script. stderr:`n$joined"
-    } else {
-        Write-Host "Pre-warm exited; stderr preview:`n$joined"
-    }
-}
+$uvxArgs = @("--from", (Get-FreshdeskPackageSpec -Ref $Ref), "--with", $McpPin, $ServerName)
 
-# ---------------------------------------------------------------------------
-# 6) Optional live API verify
-# ---------------------------------------------------------------------------
-if (-not $SkipVerify) {
+if ($Mode -eq "gateway") {
+    if ($SkipVerify) {
+        Write-Host "Skipping sign-in; Cursor will prompt on the first Freshdesk tool call."
+    } else {
+        Write-Step "Signing in to the Freshdesk gateway (first run downloads the package; a browser window opens)"
+        foreach ($name in @($entry.env.Keys)) { Set-Item -Path "Env:$name" -Value $entry.env[$name] }
+        Remove-Item Env:FRESHDESK_API_KEY -ErrorAction SilentlyContinue
+        & $uvx @uvxArgs login
+        if ($LASTEXITCODE -ne 0) {
+            throw "Sign-in failed (exit $LASTEXITCODE). The config is written; re-run with -DeviceCode, or sign in on the first tool call."
+        }
+        Write-Host "Signed in. The token is cached for this Windows user." -ForegroundColor Green
+    }
+} elseif (-not $SkipVerify) {
     Write-Step "Verifying API key against https://$Domain/api/v2/agents/me"
     $pair = "${ApiKey}:X"
     $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
@@ -252,12 +350,11 @@ if (-not $SkipVerify) {
 # Done
 # ---------------------------------------------------------------------------
 Write-Host ""
-Write-Host "DONE. Freshdesk MCP is configured." -ForegroundColor Green
+Write-Host "DONE. Freshdesk MCP is configured ($Mode mode)." -ForegroundColor Green
 Write-Host ""
 Write-Host "Required next step for YOU:"
 Write-Host "  1. In Cursor: Command Palette -> Developer: Reload Window"
-Write-Host "  2. Settings -> MCP -> confirm freshdesk-mcp is enabled / green"
-Write-Host "  3. Ask the agent to call get_agents (page 1, per_page 1)"
+Write-Host "  2. Settings -> MCP -> confirm $ServerName is enabled / green"
+Write-Host "  3. Ask the agent to get one ticket (get_ticket) or list a few (get_tickets, per_page 3)"
 Write-Host ""
-Write-Host "Do NOT set FRESHDESK_DOMAIN to supportdesk.corebridge.net (browser only; API 404s)."
 Write-Host "Do NOT remove the --with mcp[cli]>=1.3.0,<2 pin (mcp 2.x breaks the server)."

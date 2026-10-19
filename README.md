@@ -255,6 +255,40 @@ Notes:
 - The client app must be able to use the API's `access_as_user` scope (pre-authorized or consented), and the
   persistent token cache needs Windows, macOS Keychain, or Linux libsecret.
 
+### Windows / Cursor: one-shot installer
+
+`install-corebridge-freshdesk-mcp.ps1` writes the `freshdesk-mcp` entry into `%USERPROFILE%\.cursor\mcp.json`
+(other servers are kept and the file is backed up), installs `uv` if needed, and signs you in.
+
+**Default: gateway mode, no Freshdesk API key.** It points the server at the CoreBridge production gateway
+with `FRESHDESK_GATEWAY_ENV=prod`, then runs `freshdesk-mcp login` so a browser window opens once for your
+CoreBridge Microsoft account (the "Freshdesk Gateway Client" app). The token is cached with Windows DPAPI.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1
+```
+
+| Parameter | Purpose | Default |
+|---|---|---|
+| `-GatewayUrl` | Gateway base URL (https only; a `*.freshdesk.com` host is refused) | CoreBridge production gateway |
+| `-GatewayEnv` | `dev`, `qa`, `preview` or `prod` (sent as `X-CB-Env`) | `prod` |
+| `-DeviceCode` | Sign in with a URL + one-time code instead of a browser window | off |
+| `-ClientId` | Entra public client app | `b00e08ff-9e23-42f4-97b2-da02455ae39b` ("Freshdesk Gateway Client") |
+| `-Ref` | Install a specific branch/tag/commit of this repo | default branch |
+| `-SkipVerify` (`-SkipSignIn`) | Gateway: skip the sign-in now (Cursor prompts on first use). API key: skip the key check | off |
+| `-ApiKeyMode` | Legacy direct mode: call Freshdesk with your personal API key | off |
+| `-ApiKey`, `-Domain` | API-key mode only: key (prompted if omitted) and Freshdesk host | `atomology.freshdesk.com` |
+
+```powershell
+# preview environment, device-code sign-in
+powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1 -GatewayEnv preview -DeviceCode
+# legacy direct mode
+powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1 -ApiKeyMode -ApiKey "YOUR_KEY_HERE"
+```
+
+Then reload Cursor (Command Palette -> Developer: Reload Window). The installer's checks (parse,
+PSScriptAnalyzer, Pester) run with `pwsh -NoProfile -File tests/installer/Invoke-InstallerChecks.ps1`.
+
 ## Example Operations
 
 Once configured, you can ask Claude to perform operations like:

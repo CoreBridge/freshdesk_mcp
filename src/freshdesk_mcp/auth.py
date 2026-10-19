@@ -52,6 +52,12 @@ DEFAULT_ENTRA_TENANT_ID = "d7cb89e7-e0c6-44c5-8ac2-53b553372019"
 DEFAULT_ENTRA_CLIENT_ID = "b00e08ff-9e23-42f4-97b2-da02455ae39b"
 DEFAULT_ENTRA_SCOPE = "api://1e49e52c-b843-401e-9f97-8983655c5260/access_as_user"
 
+# The gateway picks the data source from this request header. An Entra caller that sends none
+# gets a cache-only, non-production environment (live lists/searches and writes are refused), so
+# reaching live Freshdesk data is an explicit opt-in: set FRESHDESK_GATEWAY_ENV (prod/preview).
+GATEWAY_ENV_HEADER = "X-CB-Env"
+GATEWAY_ENVIRONMENTS = ("dev", "qa", "preview", "prod")
+
 # Refresh a cached token when it has less than this long left.
 _TOKEN_REFRESH_MARGIN_SECONDS = 120
 
@@ -132,10 +138,18 @@ class Settings:
     tenant_id: str
     client_id: str
     scope: str
+    gateway_env: str = ""
     error: Optional[str] = None
 
+    @property
+    def extra_headers(self) -> dict[str, str]:
+        """Headers sent on every request in addition to Authorization."""
+        if self.mode == MODE_ENTRA and self.gateway_env:
+            return {GATEWAY_ENV_HEADER: self.gateway_env}
+        return {}
 
-def _validate(mode: str, base_url: str, api_key: str) -> Optional[str]:
+
+def _validate(mode: str, base_url: str, api_key: str, gateway_env: str = "") -> Optional[str]:
     if not base_url:
         return "FRESHDESK_DOMAIN is not set."
 
@@ -155,6 +169,11 @@ def _validate(mode: str, base_url: str, api_key: str) -> Optional[str]:
         )
     if scheme != "https" and host not in _LOOPBACK_HOSTS:
         return f"Entra mode requires https for {host}; refusing to send a bearer token over {scheme}."
+    if gateway_env and gateway_env not in GATEWAY_ENVIRONMENTS:
+        return (
+            f"FRESHDESK_GATEWAY_ENV='{gateway_env}' is not valid; use one of "
+            f"{', '.join(GATEWAY_ENVIRONMENTS)}."
+        )
     return None
 
 
@@ -164,10 +183,11 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
     domain = env.get("FRESHDESK_DOMAIN")
     api_key = _clean(env.get("FRESHDESK_API_KEY"))
     base_url = normalize_base_url(domain)
+    gateway_env = _clean(env.get("FRESHDESK_GATEWAY_ENV")).lower()
 
     try:
         mode = detect_auth_mode(domain, api_key, env.get("FRESHDESK_AUTH_MODE"))
-        error = _validate(mode, base_url, api_key)
+        error = _validate(mode, base_url, api_key, gateway_env)
     except AuthConfigError as exc:
         mode, error = MODE_ENTRA, str(exc)
 
@@ -180,6 +200,7 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         tenant_id=_clean(env.get("FRESHDESK_ENTRA_TENANT_ID")) or DEFAULT_ENTRA_TENANT_ID,
         client_id=_clean(env.get("FRESHDESK_ENTRA_CLIENT_ID")) or DEFAULT_ENTRA_CLIENT_ID,
         scope=_clean(env.get("FRESHDESK_ENTRA_SCOPE")) or DEFAULT_ENTRA_SCOPE,
+        gateway_env=gateway_env,
         error=error,
     )
 

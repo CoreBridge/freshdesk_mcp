@@ -109,6 +109,23 @@ class LoadSettingsTests(unittest.TestCase):
         s = load_settings({"FRESHDESK_DOMAIN": GATEWAY, "FRESHDESK_AUTH_MODE": "nope"})
         self.assertIn("FRESHDESK_AUTH_MODE", s.error)
 
+    def test_gateway_env_is_an_explicit_opt_in_header(self):
+        self.assertEqual(load_settings({"FRESHDESK_DOMAIN": GATEWAY}).extra_headers, {})
+        s = load_settings({"FRESHDESK_DOMAIN": GATEWAY, "FRESHDESK_GATEWAY_ENV": " Prod "})
+        self.assertEqual(s.extra_headers, {"X-CB-Env": "prod"})
+        self.assertIsNone(s.error)
+
+    def test_invalid_gateway_env_is_an_error(self):
+        s = load_settings({"FRESHDESK_DOMAIN": GATEWAY, "FRESHDESK_GATEWAY_ENV": "production"})
+        self.assertIn("FRESHDESK_GATEWAY_ENV", s.error)
+
+    def test_gateway_env_header_is_never_sent_in_apikey_mode(self):
+        s = load_settings(
+            {"FRESHDESK_DOMAIN": FRESHDESK, "FRESHDESK_API_KEY": "k", "FRESHDESK_GATEWAY_ENV": "prod"}
+        )
+        self.assertEqual(s.mode, MODE_API_KEY)
+        self.assertEqual(s.extra_headers, {})
+
 
 class FakeToken:
     def __init__(self, token, expires_on):
@@ -271,6 +288,13 @@ class ServerIntegrationTests(unittest.TestCase):
         _, seen = self.call_get_tickets(server, "Basic fake")
 
         self.assertEqual(seen["url"], f"https://{FRESHDESK}/api/v2/tickets?page=1&per_page=5")
+
+    def test_real_http_client_carries_the_environment_header(self):
+        server = self.load_server({"FRESHDESK_DOMAIN": GATEWAY, "FRESHDESK_GATEWAY_ENV": "prod"})
+        self.assertEqual(server.http_client().headers.get("x-cb-env"), "prod")
+
+        server = self.load_server({"FRESHDESK_DOMAIN": GATEWAY})
+        self.assertIsNone(server.http_client().headers.get("x-cb-env"))
 
     def test_delete_ticket_is_disabled_through_the_gateway(self):
         server = self.load_server({"FRESHDESK_DOMAIN": GATEWAY})

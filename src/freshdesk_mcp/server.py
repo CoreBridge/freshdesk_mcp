@@ -25,11 +25,17 @@ if SETTINGS.error:
     logging.error("Freshdesk MCP configuration error: %s", SETTINGS.error)
 else:
     logging.info("Freshdesk MCP auth mode: %s (%s)", SETTINGS.mode, API_BASE)
+    if SETTINGS.mode == MODE_ENTRA and not SETTINGS.gateway_env:
+        logging.warning(
+            "FRESHDESK_GATEWAY_ENV is not set: the gateway defaults to a cache-only, non-production "
+            "environment, so live ticket lists/searches and all writes are refused (404/403). "
+            "Set FRESHDESK_GATEWAY_ENV to 'preview' or 'prod' for live Freshdesk data."
+        )
 
 
 def http_client() -> httpx.AsyncClient:
-    """HTTP client that applies the active mode's Authorization header to every request."""
-    return httpx.AsyncClient(auth=_AUTH)
+    """HTTP client that applies the active mode's auth (and gateway environment) headers."""
+    return httpx.AsyncClient(auth=_AUTH, headers=SETTINGS.extra_headers)
 
 
 def parse_link_header(link_header: str) -> Dict[str, Optional[int]]:

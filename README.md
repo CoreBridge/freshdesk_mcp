@@ -212,10 +212,16 @@ user (Microsoft Entra ID). It switches automatically:
   "command": "uvx",
   "args": ["--from", "git+https://github.com/CoreBridge/freshdesk_mcp", "freshdesk-mcp"],
   "env": {
-    "FRESHDESK_DOMAIN": "<gateway host, e.g. cus-cb-fd-gateway-xxxx.centralus-01.azurewebsites.net>"
+    "FRESHDESK_DOMAIN": "<gateway host, e.g. cus-cb-fd-gateway-xxxx.centralus-01.azurewebsites.net>",
+    "FRESHDESK_GATEWAY_ENV": "prod"
   }
 }
 ```
+
+`FRESHDESK_GATEWAY_ENV` is sent as the gateway's `X-CB-Env` header. **Without it the gateway puts an Entra
+caller in a cache-only, non-production environment**: live ticket lists/searches return a bare `404` and
+writes are refused. Set it to `prod` (or `preview`) to read and write live Freshdesk data. It is deliberately
+not defaulted.
 
 Sign in once up front (a browser window opens; the token is cached encrypted on disk and refreshed silently):
 
@@ -228,6 +234,7 @@ Optional environment variables:
 | Variable | Purpose | Default |
 |---|---|---|
 | `FRESHDESK_AUTH_MODE` | Force `entra` or `apikey` (`auto` = detect) | `auto` |
+| `FRESHDESK_GATEWAY_ENV` | Gateway environment (`dev`, `qa`, `preview`, `prod`), sent as `X-CB-Env` | unset (gateway default: cache-only `dev`) |
 | `FRESHDESK_ENTRA_TENANT_ID` | Entra tenant | CoreBridge tenant |
 | `FRESHDESK_ENTRA_CLIENT_ID` | Public client app registration | "Freshdesk Gateway Client" |
 | `FRESHDESK_ENTRA_SCOPE` | Delegated scope on the gateway API | `api://1e49e52c-b843-401e-9f97-8983655c5260/access_as_user` |

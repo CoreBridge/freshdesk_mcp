@@ -197,6 +197,49 @@ npx -y @smithery/cli install @effytech/freshdesk_mcp --client claude
 - Replace `YOUR_FRESHDESK_API_KEY` with your actual Freshdesk API key
 - Replace `YOUR_FRESHDESK_DOMAIN` with your Freshdesk domain (e.g., `yourcompany.freshdesk.com`)
 
+### Using the CoreBridge Freshdesk gateway (Entra sign-in)
+
+Instead of a Freshdesk API key, the server can call the CoreBridge Freshdesk gateway as the signed-in
+user (Microsoft Entra ID). It switches automatically:
+
+| Condition | Mode | Calls |
+|---|---|---|
+| `FRESHDESK_API_KEY` is missing/blank, **or** `FRESHDESK_DOMAIN` is an Azure host (`*.azurewebsites.net`) | `entra` | `https://<gateway>/staff/fd/api/v2/...` with `Authorization: Bearer <Entra token>` |
+| otherwise | `apikey` | `https://<domain>/api/v2/...` with the Freshdesk API key (unchanged) |
+
+```json
+"freshdesk-mcp": {
+  "command": "uvx",
+  "args": ["--from", "git+https://github.com/CoreBridge/freshdesk_mcp", "freshdesk-mcp"],
+  "env": {
+    "FRESHDESK_DOMAIN": "<gateway host, e.g. cus-cb-fd-gateway-xxxx.centralus-01.azurewebsites.net>"
+  }
+}
+```
+
+Sign in once up front (a browser window opens; the token is cached encrypted on disk and refreshed silently):
+
+```bash
+uvx --from git+https://github.com/CoreBridge/freshdesk_mcp freshdesk-mcp login
+```
+
+Optional environment variables:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `FRESHDESK_AUTH_MODE` | Force `entra` or `apikey` (`auto` = detect) | `auto` |
+| `FRESHDESK_ENTRA_TENANT_ID` | Entra tenant | CoreBridge tenant |
+| `FRESHDESK_ENTRA_CLIENT_ID` | Public client app registration | "Freshdesk Gateway Client" |
+| `FRESHDESK_ENTRA_SCOPE` | Delegated scope on the gateway API | `api://1e49e52c-b843-401e-9f97-8983655c5260/access_as_user` |
+| `FRESHDESK_ENTRA_AUTH_RECORD` | Where the sign-in record (account id, no tokens) is kept | `~/.freshdesk-mcp/entra_auth_record.json` |
+
+Notes:
+- Entra mode refuses to run against a `*.freshdesk.com` host or over plain `http` (except `localhost`), so a
+  token is never sent to the wrong place. A misconfiguration is reported on the first tool call.
+- The gateway denies ticket deletion, so `delete_ticket` returns an error in Entra mode.
+- The client app must be able to use the API's `access_as_user` scope (pre-authorized or consented), and the
+  persistent token cache needs Windows, macOS Keychain, or Linux libsecret.
+
 ## Example Operations
 
 Once configured, you can ask Claude to perform operations like:

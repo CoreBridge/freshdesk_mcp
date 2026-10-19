@@ -239,6 +239,14 @@ Optional environment variables:
 | `FRESHDESK_ENTRA_CLIENT_ID` | Public client app registration | "Freshdesk Gateway Client" |
 | `FRESHDESK_ENTRA_SCOPE` | Delegated scope on the gateway API | `api://1e49e52c-b843-401e-9f97-8983655c5260/access_as_user` |
 | `FRESHDESK_ENTRA_AUTH_RECORD` | Where the sign-in record (account id, no tokens) is kept | `~/.freshdesk-mcp/entra_auth_record.json` |
+| `FRESHDESK_ENTRA_FLOW` | `interactive` (browser window) or `device_code` (URL + one-time code printed to stderr, for machines with no browser) | `interactive` |
+| `FRESHDESK_ENTRA_ALLOW_UNENCRYPTED_CACHE` | `1` lets the token cache fall back to a plain-text file when no OS keyring is usable. Leave unset unless you accept that | unset (encrypted only) |
+
+Linux: the encrypted token cache uses the Secret Service keyring (gnome-keyring/KWallet) through
+PyGObject, which `uvx` does not install by itself. Add `--with PyGObject` to the `uvx` arguments, e.g.
+`"args": ["--with", "PyGObject", "--from", "git+https://github.com/CoreBridge/freshdesk_mcp", "freshdesk-mcp"]`
+(and the same for `freshdesk-mcp login`). Without it the first tool call reports how to fix the cache
+instead of signing in.
 
 Notes:
 - Entra mode refuses to run against a `*.freshdesk.com` host or over plain `http` (except `localhost`), so a

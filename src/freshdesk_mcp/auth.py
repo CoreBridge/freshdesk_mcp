@@ -29,9 +29,10 @@ import logging
 import os
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncGenerator, Mapping, Optional
+from typing import Any, AsyncGenerator, Iterator, Mapping, Optional
 from urllib.parse import urlsplit
 
 import httpx
@@ -57,6 +58,29 @@ DEFAULT_ENTRA_SCOPE = "api://1e49e52c-b843-401e-9f97-8983655c5260/access_as_user
 # reaching live Freshdesk data is an explicit opt-in: set FRESHDESK_GATEWAY_ENV (prod/preview).
 GATEWAY_ENV_HEADER = "X-CB-Env"
 GATEWAY_ENVIRONMENTS = ("dev", "qa", "preview", "prod")
+
+# How the user signs in: a browser window (authorization code + PKCE, the default) or the
+# device-code flow (a URL + one-time code, for machines where no browser can be opened).
+FLOW_INTERACTIVE = "interactive"
+FLOW_DEVICE_CODE = "device_code"
+_FLOW_SPELLINGS = {
+    "interactive": FLOW_INTERACTIVE,
+    "browser": FLOW_INTERACTIVE,
+    "device_code": FLOW_DEVICE_CODE,
+    "device-code": FLOW_DEVICE_CODE,
+    "devicecode": FLOW_DEVICE_CODE,
+}
+
+_TRUTHY = ("1", "true", "yes", "on")
+
+# Raised (as ValueError) by msal-extensions when the OS keyring cannot encrypt the token cache.
+_CACHE_ENCRYPTION_MARKER = "Cache encryption is impossible"
+_CACHE_ENCRYPTION_REMEDY = (
+    "The Entra token cache cannot be encrypted on this machine (no usable OS keyring). On Linux, "
+    "run the server with PyGObject available (e.g. `uvx --with PyGObject ...`) and a Secret "
+    "Service keyring (gnome-keyring/KWallet) unlocked; or, only if you accept a plain-text token "
+    "cache in your home directory, set FRESHDESK_ENTRA_ALLOW_UNENCRYPTED_CACHE=1."
+)
 
 # Refresh a cached token when it has less than this long left.
 _TOKEN_REFRESH_MARGIN_SECONDS = 120
@@ -139,6 +163,8 @@ class Settings:
     client_id: str
     scope: str
     gateway_env: str = ""
+    entra_flow: str = FLOW_INTERACTIVE
+    allow_unencrypted_cache: bool = False
     error: Optional[str] = None
 
     @property
@@ -149,7 +175,13 @@ class Settings:
         return {}
 
 
-def _validate(mode: str, base_url: str, api_key: str, gateway_env: str = "") -> Optional[str]:
+def _validate(
+    mode: str,
+    base_url: str,
+    api_key: str,
+    gateway_env: str = "",
+    entra_flow: Optional[str] = FLOW_INTERACTIVE,
+) -> Optional[str]:
     if not base_url:
         return "FRESHDESK_DOMAIN is not set."
 
@@ -174,6 +206,8 @@ def _validate(mode: str, base_url: str, api_key: str, gateway_env: str = "") -> 
             f"FRESHDESK_GATEWAY_ENV='{gateway_env}' is not valid; use one of "
             f"{', '.join(GATEWAY_ENVIRONMENTS)}."
         )
+    if entra_flow is None:
+        return "FRESHDESK_ENTRA_FLOW is not valid; use 'interactive' or 'device_code'."
     return None
 
 
@@ -184,10 +218,15 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
     api_key = _clean(env.get("FRESHDESK_API_KEY"))
     base_url = normalize_base_url(domain)
     gateway_env = _clean(env.get("FRESHDESK_GATEWAY_ENV")).lower()
+    raw_flow = _clean(env.get("FRESHDESK_ENTRA_FLOW")).lower()
+    entra_flow = _FLOW_SPELLINGS.get(raw_flow) if raw_flow else FLOW_INTERACTIVE
+    allow_unencrypted = (
+        _clean(env.get("FRESHDESK_ENTRA_ALLOW_UNENCRYPTED_CACHE")).lower() in _TRUTHY
+    )
 
     try:
         mode = detect_auth_mode(domain, api_key, env.get("FRESHDESK_AUTH_MODE"))
-        error = _validate(mode, base_url, api_key, gateway_env)
+        error = _validate(mode, base_url, api_key, gateway_env, entra_flow)
     except AuthConfigError as exc:
         mode, error = MODE_ENTRA, str(exc)
 
@@ -201,6 +240,8 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         client_id=_clean(env.get("FRESHDESK_ENTRA_CLIENT_ID")) or DEFAULT_ENTRA_CLIENT_ID,
         scope=_clean(env.get("FRESHDESK_ENTRA_SCOPE")) or DEFAULT_ENTRA_SCOPE,
         gateway_env=gateway_env,
+        entra_flow=entra_flow or FLOW_INTERACTIVE,
+        allow_unencrypted_cache=allow_unencrypted,
         error=error,
     )
 
@@ -217,11 +258,33 @@ def _auth_record_path(env: Mapping[str, str]) -> Path:
     return Path.home() / ".freshdesk-mcp" / "entra_auth_record.json"
 
 
+def _device_code_prompt(verification_uri: str, user_code: str, expires_on: Any) -> None:
+    """Show the device-code instructions on stderr (stdout carries the MCP stdio protocol)."""
+    print(
+        f"To sign in to the Freshdesk gateway, open {verification_uri} and enter the code "
+        f"{user_code}.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+@contextmanager
+def _actionable_cache_errors() -> Iterator[None]:
+    """Turn msal-extensions' 'cannot encrypt the cache' ValueError into a config error with a fix."""
+    try:
+        yield
+    except ValueError as exc:
+        if _CACHE_ENCRYPTION_MARKER in str(exc):
+            raise AuthConfigError(_CACHE_ENCRYPTION_REMEDY) from exc
+        raise
+
+
 class EntraTokenProvider:
     """Acquires delegated Entra access tokens for the gateway API.
 
     Uses ``azure.identity.InteractiveBrowserCredential`` (authorization code + PKCE against
-    the registered ``http://localhost`` public-client redirect) with a persistent, encrypted
+    the registered ``http://localhost`` public-client redirect) — or, with
+    ``FRESHDESK_ENTRA_FLOW=device_code``, ``DeviceCodeCredential`` — with a persistent, encrypted
     token cache and a saved ``AuthenticationRecord``, so the browser opens once per refresh
     token lifetime rather than once per process. Blocking MSAL calls run in a worker thread
     and are serialized so concurrent tool calls cannot open several sign-in windows.
@@ -267,21 +330,35 @@ class EntraTokenProvider:
 
     def _get_credential(self) -> Any:
         if self._credential is None:
-            from azure.identity import InteractiveBrowserCredential, TokenCachePersistenceOptions
-
-            self._credential = InteractiveBrowserCredential(
-                tenant_id=self._settings.tenant_id,
-                client_id=self._settings.client_id,
-                cache_persistence_options=TokenCachePersistenceOptions(name="freshdesk-mcp"),
-                authentication_record=self._load_record(),
+            from azure.identity import (
+                DeviceCodeCredential,
+                InteractiveBrowserCredential,
+                TokenCachePersistenceOptions,
             )
+
+            common = {
+                "tenant_id": self._settings.tenant_id,
+                "client_id": self._settings.client_id,
+                "cache_persistence_options": TokenCachePersistenceOptions(
+                    name="freshdesk-mcp",
+                    allow_unencrypted_storage=self._settings.allow_unencrypted_cache,
+                ),
+                "authentication_record": self._load_record(),
+            }
+            if self._settings.entra_flow == FLOW_DEVICE_CODE:
+                self._credential = DeviceCodeCredential(
+                    prompt_callback=_device_code_prompt, **common
+                )
+            else:
+                self._credential = InteractiveBrowserCredential(**common)
         return self._credential
 
     # ---- public API ------------------------------------------------------------
 
     def login(self) -> str:
         """Run the interactive sign-in now and persist the result. Returns the account name."""
-        record = self._get_credential().authenticate(scopes=[self._settings.scope])
+        with _actionable_cache_errors():
+            record = self._get_credential().authenticate(scopes=[self._settings.scope])
         self._save_record(record)
         return str(record.username)
 
@@ -290,12 +367,13 @@ class EntraTokenProvider:
         if self._token and self._expires_on - now > _TOKEN_REFRESH_MARGIN_SECONDS:
             return self._token
 
-        credential = self._get_credential()
-        if not self._record_path.exists():
-            # First run: sign in once and remember who, so later processes go silent.
-            self._save_record(credential.authenticate(scopes=[self._settings.scope]))
+        with _actionable_cache_errors():
+            credential = self._get_credential()
+            if not self._record_path.exists():
+                # First run: sign in once and remember who, so later processes go silent.
+                self._save_record(credential.authenticate(scopes=[self._settings.scope]))
 
-        access = credential.get_token(self._settings.scope)
+            access = credential.get_token(self._settings.scope)
         self._token, self._expires_on = access.token, float(access.expires_on)
         return self._token
 

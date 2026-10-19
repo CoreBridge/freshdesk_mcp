@@ -11,6 +11,9 @@ from .auth import MODE_ENTRA, FreshdeskAuth, load_settings, login_cli
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
+# azure-core/azure-identity log every token request and response header at INFO, which floods
+# the console (and Cursor's MCP log) on each sign-in/refresh. Keep the Azure SDK to warnings.
+logging.getLogger("azure").setLevel(logging.WARNING)
 
 # Initialize FastMCP server
 mcp = FastMCP("freshdesk-mcp")

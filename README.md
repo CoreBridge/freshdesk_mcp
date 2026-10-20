@@ -197,10 +197,26 @@ npx -y @smithery/cli install @effytech/freshdesk_mcp --client claude
 - Replace `YOUR_FRESHDESK_API_KEY` with your actual Freshdesk API key
 - Replace `YOUR_FRESHDESK_DOMAIN` with your Freshdesk domain (e.g., `yourcompany.freshdesk.com`)
 
+### CoreBridge Support (Windows Cursor) — one-shot installer
+
+Use this on each Support agent machine. It points Cursor at the FD gateway (`entra-auth` branch),
+sets `FRESHDESK_GATEWAY_ENV=prod`, and **keeps that agent's own** `FRESHDESK_API_KEY` from
+`%USERPROFILE%\.cursor\mcp.json` (or prompts for theirs). It never ships a shared API key.
+
+```powershell
+irm https://raw.githubusercontent.com/CoreBridge/freshdesk_mcp/entra-auth/install-corebridge-freshdesk-mcp.ps1 -OutFile $env:TEMP\install-fd-mcp.ps1
+powershell -ExecutionPolicy Bypass -File $env:TEMP\install-fd-mcp.ps1
+```
+
+Then: Cursor → Command Palette → **Developer: Reload Window** → confirm `freshdesk-mcp` is green in Settings → MCP.
+
+Optional flags: `-ApiKey "YOUR_KEY"`, `-SkipLogin`, `-Login` (force Entra browser sign-in), `-SkipVerify`.
+
 ### Using the CoreBridge Freshdesk gateway (Entra sign-in)
 
-Instead of a Freshdesk API key, the server can call the CoreBridge Freshdesk gateway as the signed-in
-user (Microsoft Entra ID). It switches automatically:
+The server can call the CoreBridge Freshdesk gateway as the signed-in user (Microsoft Entra ID).
+When the domain is the Azure gateway host, tool calls use Entra Bearer auth. Your personal
+Freshdesk API key can still be kept in `mcp.json` for fallback / non-gateway use; do not share keys.
 
 | Condition | Mode | Calls |
 |---|---|---|
@@ -210,9 +226,14 @@ user (Microsoft Entra ID). It switches automatically:
 ```json
 "freshdesk-mcp": {
   "command": "uvx",
-  "args": ["--from", "git+https://github.com/CoreBridge/freshdesk_mcp", "freshdesk-mcp"],
+  "args": [
+    "--from", "git+https://github.com/CoreBridge/freshdesk_mcp@entra-auth",
+    "--with", "mcp[cli]>=1.3.0,<2",
+    "freshdesk-mcp"
+  ],
   "env": {
-    "FRESHDESK_DOMAIN": "<gateway host, e.g. cus-cb-fd-gateway-xxxx.centralus-01.azurewebsites.net>",
+    "FRESHDESK_API_KEY": "<YOUR personal Freshdesk API key>",
+    "FRESHDESK_DOMAIN": "cus-cb-fd-gateway-cjccdjf4gxg5dbhr.centralus-01.azurewebsites.net",
     "FRESHDESK_GATEWAY_ENV": "prod"
   }
 }
@@ -226,7 +247,7 @@ not defaulted.
 Sign in once up front (a browser window opens; the token is cached encrypted on disk and refreshed silently):
 
 ```bash
-uvx --from git+https://github.com/CoreBridge/freshdesk_mcp freshdesk-mcp login
+uvx --from git+https://github.com/CoreBridge/freshdesk_mcp@entra-auth freshdesk-mcp login
 ```
 
 Optional environment variables:

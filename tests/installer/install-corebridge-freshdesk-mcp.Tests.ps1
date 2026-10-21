@@ -3,32 +3,75 @@
 
 BeforeAll {
     $script:Installer = Join-Path $PSScriptRoot "../../install-corebridge-freshdesk-mcp.ps1"
-    . $script:Installer
+    # -GatewayUrl is mandatory, so pass one; the script returns right after defining its helpers.
+    . $script:Installer -GatewayUrl "https://gw.example.azurewebsites.net"
     $script:Uvx = "C:\Users\me\.local\bin\uvx.exe"
     $script:Gateway = "https://gw.example.azurewebsites.net"
+
+    function Get-InstallerParam([string]$Name) {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Installer, [ref]$null, [ref]$null)
+        return $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq $Name }
+    }
+
+    function Get-ParameterAttributeArgs($Param) {
+        # Named arguments of every [Parameter(...)] attribute on the parameter.
+        $Param.Attributes | Where-Object { $_.TypeName.Name -eq "Parameter" } | ForEach-Object {
+            $named = @{}
+            foreach ($arg in $_.NamedArguments) { $named[$arg.ArgumentName] = $arg.Argument.Extent.Text.Trim('"') }
+            $named
+        }
+    }
 }
 
 Describe "script defaults" {
-    It "defaults to gateway mode against prod with the Freshdesk Gateway Client" {
-        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Installer, [ref]$null, [ref]$null)
-        $params = @{}
-        foreach ($p in $ast.ParamBlock.Parameters) {
-            $value = $null
-            if ($p.DefaultValue) { $value = $p.DefaultValue.SafeGetValue() }
-            $params[$p.Name.VariablePath.UserPath] = $value
-        }
-        $params["GatewayEnv"] | Should -Be "prod"
-        $params["ClientId"] | Should -Be "b00e08ff-9e23-42f4-97b2-da02455ae39b"
-        $params["GatewayUrl"] | Should -Match "^https://"
-        $params["ApiKey"] | Should -Be ""
-        $params.ContainsKey("ApiKeyMode") | Should -BeTrue
+    It "requires -GatewayUrl in gateway mode and gives it no default" {
+        $p = Get-InstallerParam "GatewayUrl"
+        $p.DefaultValue | Should -BeNullOrEmpty
+        $attr = Get-ParameterAttributeArgs $p
+        $attr.Mandatory | Should -Be '$true'
+        $attr.ParameterSetName | Should -Be "Gateway"
+        $attr.HelpMessage | Should -Not -BeNullOrEmpty
+    }
+
+    It "refuses to run without -GatewayUrl (non-interactive) before touching anything" {
+        $shell = (Get-Process -Id $PID).Path
+        $out = & $shell -NoProfile -NonInteractive -File $script:Installer 2>&1 | Out-String
+        $LASTEXITCODE | Should -Not -Be 0
+        $out | Should -Match "GatewayUrl"
+        $out | Should -Not -Match "Checking for uv"
+    }
+
+    It "does not require -GatewayUrl in API-key mode" {
+        $attr = Get-ParameterAttributeArgs (Get-InstallerParam "ApiKeyMode")
+        $attr.Mandatory | Should -Be '$true'
+        $attr.ParameterSetName | Should -Be "ApiKey"
+        $cmd = Get-Command $script:Installer
+        $apiKeySet = $cmd.ParameterSets | Where-Object Name -eq "ApiKey"
+        ($apiKeySet.Parameters | Where-Object Name -eq "GatewayUrl") | Should -BeNullOrEmpty
+        ($cmd.ParameterSets | Where-Object IsDefault).Name | Should -Be "Gateway"
+    }
+
+    It "defaults the environment to prod and the client to the Freshdesk Gateway Client" {
+        (Get-InstallerParam "GatewayEnv").DefaultValue.SafeGetValue() | Should -Be "prod"
+        (Get-InstallerParam "ClientId").DefaultValue.SafeGetValue() | Should -Be "b00e08ff-9e23-42f4-97b2-da02455ae39b"
+        (Get-InstallerParam "ApiKey").DefaultValue.SafeGetValue() | Should -Be ""
     }
 
     It "only accepts known gateway environments" {
-        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Installer, [ref]$null, [ref]$null)
-        $envParam = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq "GatewayEnv" }
-        $validate = $envParam.Attributes | Where-Object { $_.TypeName.Name -eq "ValidateSet" }
+        $validate = (Get-InstallerParam "GatewayEnv").Attributes | Where-Object { $_.TypeName.Name -eq "ValidateSet" }
         ($validate.PositionalArguments | ForEach-Object { $_.Value }) | Should -Be @("dev", "qa", "preview", "prod")
+    }
+
+    It "does not publish a deployed gateway hostname" {
+        (Get-Content $script:Installer -Raw) | Should -Not -Match "azurewebsites\.net"
+    }
+
+    It "explains when to use test versus prod in the help" {
+        $help = Get-Help $script:Installer -Full | Out-String -Width 200
+        $help | Should -Match "CHOOSING TEST vs PROD"
+        $help | Should -Match "dev/qa:\s+TEST"
+        $help | Should -Match "prod:\s+LIVE"
+        $help | Should -Match "preview: also LIVE"
     }
 }
 
@@ -76,6 +119,12 @@ Describe "Get-NormalizedGatewayUrl" {
 
     It "refuses plain http (a bearer token would travel unencrypted)" {
         { Get-NormalizedGatewayUrl -GatewayUrl "http://gw.example.net" } | Should -Throw "*https*"
+    }
+
+    It "allows plain http only for a gateway on this machine" {
+        Get-NormalizedGatewayUrl -GatewayUrl "http://localhost:5000" | Should -Be "http://localhost:5000"
+        Get-NormalizedGatewayUrl -GatewayUrl "http://127.0.0.1:5000/" | Should -Be "http://127.0.0.1:5000"
+        { Get-NormalizedGatewayUrl -GatewayUrl "http://localhost.evil.example" } | Should -Throw "*https*"
     }
 
     It "refuses a Freshdesk host (an Entra token must never go to Freshdesk)" {

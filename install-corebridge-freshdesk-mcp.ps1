@@ -7,12 +7,36 @@
 
   DEFAULT: gateway mode. No Freshdesk API key is needed.
     - Freshdesk is reached through the CoreBridge Freshdesk gateway (https://<gateway>/staff/fd).
+      -GatewayUrl is REQUIRED in this mode: there is no built-in default, so you always choose
+      which gateway (and, with -GatewayEnv, which data) you are pointing Cursor at.
     - You sign in with your CoreBridge Microsoft (Entra ID) account through the
       "Freshdesk Gateway Client" app. A browser window opens once; the token is cached
       (encrypted with Windows DPAPI) and refreshed silently afterwards.
     - The gateway environment defaults to prod (live Freshdesk data). It is sent as X-CB-Env.
 
   OPTIONAL: -ApiKeyMode keeps the old direct mode (Freshdesk API with your personal API key).
+
+  CHOOSING TEST vs PROD (-GatewayUrl + -GatewayEnv)
+    One deployed gateway serves every environment; the URL picks WHICH GATEWAY, and -GatewayEnv
+    picks WHICH DATA you get from it. Ask the support lead / platform team for the deployed
+    gateway URL (it is not published in this repo).
+
+      Goal                                   -GatewayUrl                    -GatewayEnv
+      -------------------------------------  -----------------------------  -----------
+      Day-to-day support work (real tickets) the deployed gateway URL       prod
+      Try the MCP safely / demo / training   the deployed gateway URL       dev  (or qa)
+      Work against a gateway you run locally http://localhost:<port>        dev
+      Preview environment                    the deployed gateway URL       preview
+
+    - prod:    LIVE Freshdesk. Lists, searches and WRITES (replies, notes, updates) are real
+               and visible to customers.
+    - dev/qa:  TEST. A cache-only copy of production ticket data: requests the cache can answer
+               work, anything it cannot answer is refused (403/404), and every write is refused
+               (403 env_restricted). Nothing you do reaches Freshdesk, so it is safe to experiment.
+    - preview: also LIVE. Preview serves real customers on the same Freshdesk account, so
+               treat it like prod, not like a sandbox.
+    - A local gateway (http://localhost or http://127.0.0.1 only) is for gateway developers.
+      Plain http is refused for any other host, because an Entra token is sent to it.
 
   In both modes the installer also:
     1. Uses the CoreBridge GitHub repo via uvx (not the old local Node install)
@@ -22,11 +46,13 @@
     5. Keeps your other MCP servers in mcp.json untouched (and backs the file up first)
 
 .PARAMETER GatewayUrl
-  Freshdesk gateway base URL (gateway mode). Default: the CoreBridge production gateway.
+  REQUIRED in gateway mode. Freshdesk gateway base URL, e.g. https://<gateway-host> (a bare host is
+  accepted and https is assumed), or http://localhost:<port> for a locally run gateway.
+  A *.freshdesk.com host is refused. See "CHOOSING TEST vs PROD" above.
 
 .PARAMETER GatewayEnv
-  Gateway environment sent as X-CB-Env: dev, qa, preview or prod. Default: prod.
-  dev/qa are cache-only (no live lists/searches, no writes).
+  Gateway environment sent as X-CB-Env: dev, qa, preview or prod. Default: prod (live).
+  Use dev or qa to test safely (cache-only, writes refused). See "CHOOSING TEST vs PROD" above.
 
 .PARAMETER DeviceCode
   Sign in with a device code (URL + one-time code) instead of a browser window.
@@ -53,15 +79,19 @@
   ApiKeyMode: skip the live API key check.
 
 .EXAMPLE
-  # Gateway mode, production (recommended)
-  powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1
+  # Day-to-day support work: production gateway, live data
+  powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1 -GatewayUrl https://<gateway-host>
 
 .EXAMPLE
-  # Gateway mode against preview, signing in with a device code
-  powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1 -GatewayEnv preview -DeviceCode
+  # Try it out safely: same gateway, cache-only test data, writes refused
+  powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1 -GatewayUrl https://<gateway-host> -GatewayEnv dev
 
 .EXAMPLE
-  # Legacy direct mode with a Freshdesk API key
+  # Gateway developers: a gateway running locally, signing in with a device code
+  powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1 -GatewayUrl http://localhost:5000 -GatewayEnv dev -DeviceCode
+
+.EXAMPLE
+  # Legacy direct mode with a Freshdesk API key (no -GatewayUrl needed)
   powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1 -ApiKeyMode -ApiKey "YOUR_KEY_HERE"
 
 .NOTES
@@ -70,15 +100,24 @@
   Repo: https://github.com/CoreBridge/freshdesk_mcp
 #>
 
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = "Gateway")]
 param(
-    [string]$GatewayUrl = "https://cus-cb-fd-gateway-cjccdjf4gxg5dbhr.centralus-01.azurewebsites.net",
+    [Parameter(Mandatory = $true, ParameterSetName = "Gateway",
+        HelpMessage = "Freshdesk gateway URL, e.g. https://<gateway-host> (ask the support lead), or http://localhost:<port> for a local gateway.")]
+    [ValidateNotNullOrEmpty()]
+    [string]$GatewayUrl,
+    [Parameter(ParameterSetName = "Gateway")]
     [ValidateSet("dev", "qa", "preview", "prod")]
     [string]$GatewayEnv = "prod",
+    [Parameter(ParameterSetName = "Gateway")]
     [switch]$DeviceCode,
+    [Parameter(ParameterSetName = "Gateway")]
     [string]$ClientId = "b00e08ff-9e23-42f4-97b2-da02455ae39b",
+    [Parameter(Mandatory = $true, ParameterSetName = "ApiKey")]
     [switch]$ApiKeyMode,
+    [Parameter(ParameterSetName = "ApiKey")]
     [string]$ApiKey = "",
+    [Parameter(ParameterSetName = "ApiKey")]
     [string]$Domain = "atomology.freshdesk.com",
     [string]$Ref = "",
     [Alias("SkipSignIn")]
@@ -112,14 +151,18 @@ function Get-NormalizedGatewayUrl {
         throw "GatewayUrl '$GatewayUrl' is not a valid URL."
     }
     if ($uri.Scheme -ne "https") {
-        throw "GatewayUrl must use https (an Entra token is sent to it): '$GatewayUrl'."
+        # Plain http only for a gateway running on this machine (gateway development).
+        $loopback = @("localhost", "127.0.0.1", "[::1]", "::1")
+        if (-not ($uri.Scheme -eq "http" -and $loopback -contains $uri.Host.ToLowerInvariant())) {
+            throw "GatewayUrl must use https (an Entra token is sent to it); plain http is allowed only for localhost: '$GatewayUrl'."
+        }
     }
     if ($uri.Host -match "(^|\.)freshdesk\.com$") {
         throw "GatewayUrl points at Freshdesk ($($uri.Host)), not the CoreBridge gateway. Use -ApiKeyMode for direct Freshdesk access."
     }
     $port = ""
     if (-not $uri.IsDefaultPort) { $port = ":$($uri.Port)" }
-    return "https://$($uri.Host)$port"
+    return "$($uri.Scheme)://$($uri.Host)$port"
 }
 
 function New-FreshdeskMcpEntry {

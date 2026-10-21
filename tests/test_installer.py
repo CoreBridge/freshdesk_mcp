@@ -15,7 +15,7 @@ CHECKS = ROOT / "tests" / "installer" / "Invoke-InstallerChecks.ps1"
 
 
 def param_block(text):
-    match = re.search(r"\[CmdletBinding\(\)\]\s*param\((.*?)\n\)", text, re.S)
+    match = re.search(r"\[CmdletBinding\([^)]*\)\]\s*param\((.*?)\n\)", text, re.S)
     assert match, "installer has no top-level param block"
     return match.group(1)
 
@@ -33,12 +33,26 @@ class InstallerStaticTests(unittest.TestCase):
 
     def test_defaults_to_gateway_mode_on_prod_with_the_gateway_client(self):
         params = param_block(self.text)
+        self.assertIn('[CmdletBinding(DefaultParameterSetName = "Gateway")]', self.text)
         self.assertIn('[string]$GatewayEnv = "prod"', params)
         self.assertIn('[ValidateSet("dev", "qa", "preview", "prod")]', params)
         self.assertIn('[string]$ClientId = "b00e08ff-9e23-42f4-97b2-da02455ae39b"', params)
-        self.assertRegex(params, r'\[string\]\$GatewayUrl = "https://')
         self.assertIn("[switch]$ApiKeyMode", params)
         self.assertIn('[string]$ApiKey = ""', params)
+
+    def test_gateway_url_is_required_and_has_no_default(self):
+        params = param_block(self.text)
+        self.assertRegex(
+            params,
+            r'\[Parameter\(Mandatory = \$true, ParameterSetName = "Gateway",[^\]]*HelpMessage = "[^"]+"\)\]'
+            r'\s*\[ValidateNotNullOrEmpty\(\)\]\s*\[string\]\$GatewayUrl,',
+        )
+        self.assertNotRegex(params, r"\$GatewayUrl\s*=")
+        self.assertNotIn("azurewebsites.net", self.text)  # no deployed host published in the repo
+
+    def test_help_explains_test_versus_prod(self):
+        for phrase in ("CHOOSING TEST vs PROD", "dev/qa:  TEST", "prod:    LIVE", "preview: also LIVE"):
+            self.assertIn(phrase, self.text)
 
     def test_gateway_entry_never_carries_an_api_key(self):
         body = function_body(self.text, "New-FreshdeskMcpEntry")

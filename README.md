@@ -260,31 +260,45 @@ Notes:
 `install-corebridge-freshdesk-mcp.ps1` writes the `freshdesk-mcp` entry into `%USERPROFILE%\.cursor\mcp.json`
 (other servers are kept and the file is backed up), installs `uv` if needed, and signs you in.
 
-**Default: gateway mode, no Freshdesk API key.** It points the server at the CoreBridge production gateway
-with `FRESHDESK_GATEWAY_ENV=prod`, then runs `freshdesk-mcp login` so a browser window opens once for your
-CoreBridge Microsoft account (the "Freshdesk Gateway Client" app). The token is cached with Windows DPAPI.
+**Default: gateway mode, no Freshdesk API key.** `-GatewayUrl` is **required** (there is no built-in
+default, so you always choose what you point Cursor at). It writes `FRESHDESK_GATEWAY_ENV=prod` unless you pass
+`-GatewayEnv`, then runs `freshdesk-mcp login` so a browser window opens once for your CoreBridge Microsoft
+account (the "Freshdesk Gateway Client" app). The token is cached with Windows DPAPI. Ask the support lead or
+platform team for the deployed gateway URL; it is not published here.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1
+powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1 -GatewayUrl https://<gateway-host>
 ```
+
+**Test vs prod.** One deployed gateway serves every environment: `-GatewayUrl` picks the gateway, `-GatewayEnv`
+picks the data.
+
+| Goal | `-GatewayUrl` | `-GatewayEnv` | What you get |
+|---|---|---|---|
+| Day-to-day support work | deployed gateway | `prod` (default) | LIVE Freshdesk: lists, searches and writes (replies, notes, updates) are real and customer-visible |
+| Try it safely, demo, training | deployed gateway | `dev` (or `qa`) | TEST: cache-only copy of production ticket data; requests the cache cannot answer are refused (403/404) and every write is refused (`403 env_restricted`), so nothing reaches Freshdesk |
+| Preview environment | deployed gateway | `preview` | also LIVE: preview serves real customers on the same Freshdesk account, so treat it like prod |
+| Gateway development | `http://localhost:<port>` | `dev` | a gateway you run locally (plain http is allowed only for localhost) |
 
 | Parameter | Purpose | Default |
 |---|---|---|
-| `-GatewayUrl` | Gateway base URL (https only; a `*.freshdesk.com` host is refused) | CoreBridge production gateway |
+| `-GatewayUrl` | **Required in gateway mode.** Gateway base URL (https, or http for localhost only; a `*.freshdesk.com` host is refused) | none |
 | `-GatewayEnv` | `dev`, `qa`, `preview` or `prod` (sent as `X-CB-Env`) | `prod` |
 | `-DeviceCode` | Sign in with a URL + one-time code instead of a browser window | off |
 | `-ClientId` | Entra public client app | `b00e08ff-9e23-42f4-97b2-da02455ae39b` ("Freshdesk Gateway Client") |
 | `-Ref` | Install a specific branch/tag/commit of this repo | default branch |
 | `-SkipVerify` (`-SkipSignIn`) | Gateway: skip the sign-in now (Cursor prompts on first use). API key: skip the key check | off |
-| `-ApiKeyMode` | Legacy direct mode: call Freshdesk with your personal API key | off |
+| `-ApiKeyMode` | Legacy direct mode: call Freshdesk with your personal API key (no `-GatewayUrl`) | off |
 | `-ApiKey`, `-Domain` | API-key mode only: key (prompted if omitted) and Freshdesk host | `atomology.freshdesk.com` |
 
 ```powershell
-# preview environment, device-code sign-in
-powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1 -GatewayEnv preview -DeviceCode
+# try it safely against test data, device-code sign-in
+powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1 -GatewayUrl https://<gateway-host> -GatewayEnv dev -DeviceCode
 # legacy direct mode
 powershell -ExecutionPolicy Bypass -File .\install-corebridge-freshdesk-mcp.ps1 -ApiKeyMode -ApiKey "YOUR_KEY_HERE"
 ```
+
+`Get-Help .\install-corebridge-freshdesk-mcp.ps1 -Full` shows the same guidance.
 
 Then reload Cursor (Command Palette -> Developer: Reload Window). The installer's checks (parse,
 PSScriptAnalyzer, Pester) run with `pwsh -NoProfile -File tests/installer/Invoke-InstallerChecks.ps1`.

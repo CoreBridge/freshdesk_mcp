@@ -8,6 +8,7 @@ import re
 from pydantic import BaseModel, Field
 
 from .auth import MODE_ENTRA, FreshdeskAuth, load_settings, login_cli
+from .note_notify import resolve_note_notify
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -452,16 +453,50 @@ async def create_ticket_reply(
         return response.json()
 
 @mcp.tool()
-async def create_ticket_note(ticket_id: int,body: str)-> Dict[str, Any]:
-    """Create a note for a ticket in Freshdesk."""
+async def create_ticket_note(
+    ticket_id: int,
+    body: str,
+    private: bool = True,
+    notify_emails: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Create a note for a ticket in Freshdesk.
+
+    Agent @-tags in the body (`/a/agents/{id}` anchors) are real notifications:
+    notify_emails is auto-filled from ~/.cursor/skills/corebridge-staff-directory/directory.yaml
+    and unioned with any explicit notify_emails. Posts with unresolved tags are refused
+    (FD-414725 — visual-only tags must never ship).
+    """
+    resolved = resolve_note_notify(body, notify_emails=notify_emails)
+    if not resolved.get("ok"):
+        return {
+            "error": "FRESHDESK_NOTE_NOTIFY: FAIL",
+            "reason": resolved.get("error"),
+            "tagged_agent_ids": resolved.get("tagged_agent_ids"),
+            "unresolved_agent_ids": resolved.get("unresolved_agent_ids"),
+            "hint": (
+                "Agent page anchors require resolvable notify_emails from the staff "
+                "directory. Fix the tag href or directory entry; do not post visual-only tags."
+            ),
+        }
     url = f"{API_BASE}/tickets/{ticket_id}/notes"
     headers = {}
-    data = {
-        "body": body
+    data: Dict[str, Any] = {
+        "body": body,
+        "private": bool(private),
     }
+    final_notify = resolved.get("notify_emails") or []
+    if final_notify:
+        data["notify_emails"] = final_notify
     async with http_client() as client:
         response = await client.post(url, headers=headers, json=data)
-        return response.json()
+        payload = response.json()
+        if isinstance(payload, dict):
+            payload["_note_notify"] = {
+                "notify_emails": final_notify,
+                "tagged_agent_ids": resolved.get("tagged_agent_ids"),
+                "auto_added": resolved.get("auto_added"),
+            }
+        return payload
 
 @mcp.tool()
 async def update_ticket_conversation(conversation_id: int,body: str)-> Dict[str, Any]:
